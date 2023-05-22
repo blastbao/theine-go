@@ -31,8 +31,8 @@ type Shard[K comparable, V any] struct {
 	group     Group[K, Loaded[V]]
 	size      uint
 	qsize     uint
-	qlen      int
-	counter   uint
+	qlen      int				//
+	counter   uint				// 布隆过滤器的非冲突元素数目
 	mu        sync.RWMutex
 }
 
@@ -192,24 +192,33 @@ func (s *Store[K, V]) Get(key K) (V, bool) {
 }
 
 func (s *Store[K, V]) Set(key K, value V, cost int64, ttl time.Duration) bool {
+	// 计算字节数
 	if cost == 0 {
 		cost = s.cost(value)
 	}
 	if cost > int64(s.cap) {
 		return false
 	}
+
+	// 定位分片
 	h, index := s.index(key)
 	shard := s.shards[index]
+
+	// 计算超时时间（绝对时间）
 	var expire int64
 	if ttl != 0 {
 		expire = s.timerwheel.clock.expireNano(ttl)
 	}
+
 	shard.mu.Lock()
 	exist, ok := shard.get(key)
+	// 已存在，更新
 	if ok {
 		var reschedule bool
 		var costChange int64
 		exist.value = value
+
+		// 更新 cost
 		oldCost := exist.cost.Swap(cost)
 		if oldCost != cost {
 			costChange = cost - oldCost
@@ -217,6 +226,8 @@ func (s *Store[K, V]) Set(key K, value V, cost int64, ttl time.Duration) bool {
 				shard.qlen += int(costChange)
 			}
 		}
+
+		// 更新 ttl
 		shard.mu.Unlock()
 		if expire > 0 {
 			old := exist.expire.Swap(expire)
@@ -224,25 +235,34 @@ func (s *Store[K, V]) Set(key K, value V, cost int64, ttl time.Duration) bool {
 				reschedule = true
 			}
 		}
+
+		// ?
 		if reschedule || costChange != 0 {
 			s.writebuf <- WriteBufItem[K, V]{
 				entry: exist, code: UPDATE, costChange: costChange, rechedule: reschedule,
 			}
 		}
+
 		return true
 	}
+
+	// 布隆过滤器
 	if s.doorkeeper {
+		// 布隆过滤器容量不足，误差升高，则重置
 		if shard.counter > uint(shard.dookeeper.capacity) {
 			shard.dookeeper.reset()
 			shard.counter = 0
 		}
+		// 插入布隆过滤器
 		hit := shard.dookeeper.insert(h)
 		if !hit {
-			shard.counter += 1
+			shard.counter += 1 // 更新布隆过滤器的非冲突元素计数
 			shard.mu.Unlock()
 			return false
 		}
 	}
+
+	// 新建 Entry 并初始化
 	entry := s.entryPool.Get().(*Entry[K, V])
 	entry.frequency.Store(-1)
 	entry.shard = uint16(index)
@@ -250,13 +270,17 @@ func (s *Store[K, V]) Set(key K, value V, cost int64, ttl time.Duration) bool {
 	entry.value = value
 	entry.expire.Store(expire)
 	entry.cost.Store(cost)
+
+	// 插入到 shard
 	shard.set(key, entry)
+
 	// cost larger than deque size, send to policy directly
 	if cost > int64(shard.qsize) {
 		shard.mu.Unlock()
 		s.writebuf <- WriteBufItem[K, V]{entry: entry, code: NEW}
 		return true
 	}
+
 	entry.deque = true
 	shard.deque.PushFront(entry)
 	shard.qlen += int(cost)
